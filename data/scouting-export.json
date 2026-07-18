@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "sessions": [
+    {
+      "id": "2453220fdf87464fb257fbb6e6b5e30c",
+      "scout_name": "demo",
+      "event_code": "test-event",
+      "team_number": 1234,
+      "match_number": 1,
+      "alliance": "blue",
+      "driver_station": null,
+      "game_config_id": "frc-example-2026",
+      "started_at": "2026-07-09T06:13:19.550674+00:00"
+    }
+  ],
+  "transcript_chunks": [
+    {
+      "id": "2f9b805cab8c4834930ae94a11dc5607",
+      "session_id": "2453220fdf87464fb257fbb6e6b5e30c",
+      "text": "Start match. Robot scored a coral high and then played defense.",
+      "said_at": 3.2,
+      "is_final": 1
+    }
+  ],
+  "scouting_events": [
+    {
+      "id": "2586e30f092a4565bcb9881e8266d2ca",
+      "session_id": "2453220fdf87464fb257fbb6e6b5e30c",
+      "event_type": "defense",
+      "said_at": 3.2,
+      "value": null,
+      "game_piece": "coral",
+      "points": null,
+      "source_text": "Start match. Robot scored a coral high and then played defense.",
+      "confidence": 1.0
+    },
+    {
+      "id": "2c569e7e2a454574aabf6e0e1b6e628a",
+      "session_id": "2453220fdf87464fb257fbb6e6b5e30c",
+      "event_type": "match_started",
+      "said_at": 3.2,
+      "value": null,
+      "game_piece": null,
+      "points": null,
+      "source_text": "start match robot scored a coral high and then played defense",
+      "confidence": 1.0
+    },
+    {
+      "id": "b3a21fd5a4564e49abe8298ee4b4ad6a",
+      "session_id": "2453220fdf87464fb257fbb6e6b5e30c",
+      "event_type": "score",
+      "said_at": 3.2,
+      "value": "high",
+      "game_piece": "coral",
+      "points": 1,
+      "source_text": "Start match. Robot scored a coral high and then played defense.",
+      "confidence": 1.0
+    }
+  ]
+}

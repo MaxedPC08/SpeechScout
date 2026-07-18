@@ -1,0 +1,19 @@
+{
+    "periods":{
+        "autonomous": 20,
+        "teleop": 120,
+        "endgame": 30
+    },
+    "scores":{
+        "level 3":{"keywords": ["highest level", "up top", "top level", "L 3"], "points": 5},
+        "level 2":{"keywords": ["middle level", "mid level"], "points": 3},
+        "level 1":{"keywords": ["lowest level", "bottom level"], "points": 1}
+    },
+    "penalties":{
+        "foul":{"keywords": ["foul", "penalty"], "points": -5},
+        "technical foul":{"keywords": ["technical foul", "tech foul", "major foul", "major penalty"], "points": -10}
+    },
+    "ignore_words": ["the", "a", "an", "and", "or", "but", "is", "are", "was", "were", "in", "on", "at", "to", "of", "they", "them", "their", "this", "that", "these", "those", "for", "with", "as", "by", "from", "draw", "score", "points", "point", "scored", "scoring", "scored", "scoring", "looks", "like"],
+    "stt_latency": 0.5,
+    "root_path": "/home/mclemetsen/Code/SpeechScout/matches"
+}
