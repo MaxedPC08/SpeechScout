@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 import json
 from pathlib import Path
 from threading import Lock
@@ -8,46 +8,26 @@ from time import monotonic
 
 from typing import Dict, List, Optional
 
-from config import Match, TextBlock
+from config import Match, MatchNote, ScoreEvent, TextBlock
 from string_parsing import StringParser
 
-SCORE_CONTEXT_BLOCKS = 6
 DUPLICATE_SCORE_WINDOW_SECONDS = 2.0
 NOTE_MERGE_WINDOW_SECONDS = 2
-NOTE_FINAL_WINDOW_SECONDS = 3.0
 TRANSCRIPTION_SIMILARITY_THRESHOLD = 5
-@dataclass(frozen=True)
-class ScoreEvent:
-    name: str
-    points: int
-    timestamp: float
-    transcript: str
-    alt_points: Optional[int] = None
-
-
-@dataclass(frozen=False)
-class MatchNote:
-    timestamp: float
-    text: str
-
 
 class MatchHandler:
     """Owns a match's live transcript and score ledger."""
 
     def __init__(self, config: Dict, personal_config: Dict, match: Match):
-        self.config = config
         self.root_path = personal_config["root_path"]
         self.scout_name = personal_config["scout_name"]
         self.scout_number = personal_config["scout_number"]
         self.predicted_winner: Optional[str] = None
         self.path: Optional[str] = None
         self.match = match
-        self.ignore_words = set(config.get("ignore_words", []))
-        self.stt_latency = config.get("stt_latency", 0.5)
         self.parser = StringParser(config)
         self._lock = Lock()
         self._started_at: Optional[float] = None
-        self._text_blocks: List[TextBlock] = []
         self._events: List[ScoreEvent] = []
         self._notes: List[MatchNote] = []
         self._last_transcript = ""
@@ -60,7 +40,6 @@ class MatchHandler:
             raise ValueError("Predicted winner must be 'red' or 'blue'.")
         with self._lock:
             self._started_at = monotonic()
-            self._text_blocks = []
             self._events = []
             self._notes = []
             self._last_transcript = ""
@@ -100,7 +79,6 @@ class MatchHandler:
         self.save_match()
         with self._lock:
             self._started_at = None
-            self._text_blocks = []
 
     def process_chunk(self, transcript: str, is_final: bool = True) -> Optional[ScoreEvent]:
         """Record one STT chunk and return its score event, if it creates one."""
@@ -111,8 +89,8 @@ class MatchHandler:
 
         with self._lock:
             previous_transcript = self._last_transcript
-            parsed_transcript = self.parser.clean_word(transcript.strip(".")).split()
-            parsed_last_transcript = self.parser.clean_word(self._last_transcript).split()
+            parsed_transcript = self.parser.clense_word(transcript.strip(".")).split()
+            parsed_last_transcript = self.parser.clense_word(self._last_transcript).split()
 
             def is_similar(a: list[str], b: list[str]) -> bool:
                 index = 0
@@ -140,6 +118,41 @@ class MatchHandler:
                 new_blocks
             )
             if name is None or points is None:
+                breakdown_name, breakdown_at = self.parser.get_breakdown_in_string(new_blocks)
+                if breakdown_name is not None:
+                    common_prefix = 0
+                    for old_word, new_word in zip(parsed_last_transcript, parsed_transcript):
+                        if old_word.casefold() != new_word.casefold():
+                            break
+                        common_prefix += 1
+                    is_cumulative_update = common_prefix >= 2 or common_prefix == len(parsed_last_transcript) > 0
+                    if (
+                        is_cumulative_update
+                        and self.parser.breakdown_match_count(transcript, breakdown_name)
+                        <= self.parser.breakdown_match_count(previous_transcript, breakdown_name)
+                    ):
+                        return None
+
+                    score_key = f"breakdown:{breakdown_name}"
+                    if (
+                        score_key == self._last_score_key
+                        and self._last_score_at is not None
+                        and said_at - self._last_score_at < DUPLICATE_SCORE_WINDOW_SECONDS
+                    ):
+                        return None
+
+                    self._discard_pending_note()
+                    event = ScoreEvent(
+                        name="breakdown",
+                        points=0,
+                        alt_points=None,
+                        timestamp=max(0.0, breakdown_at if breakdown_at is not None else said_at),
+                        transcript=transcript,
+                    )
+                    self._events.append(event)
+                    self._last_score_key = score_key
+                    self._last_score_at = said_at
+                    return event
                 self._save_note(said_at, transcript, is_update=is_update)
                 return None
 

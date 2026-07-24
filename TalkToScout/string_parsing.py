@@ -1,10 +1,7 @@
-from dataclasses import dataclass
-from config import TextBlock
 import re
-from typing import Union
-from typing import List, Dict
-import re
+from typing import Dict, List, Union
 
+from config import SpokenWord, TextBlock
 
 Timestamp = Union[float, str]
 WORD_PATTERN = re.compile(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?")
@@ -12,12 +9,6 @@ WORD_PATTERN = re.compile(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?")
 SCORE = "score"
 PENALTY = "penalty"
 ALL = "all"
-
-@dataclass(frozen=True)
-class SpokenWord:
-    word: str
-    said_at: Timestamp
-
 
 def words_with_timestamp(text: str, said_at: Timestamp) -> list[SpokenWord]:
     return [
@@ -56,7 +47,9 @@ class StringParser:
                 return period
         return None
     
-    def stitch_text_blocks(self, text_blocks: List[TextBlock], strip_punctuation=False) -> str:
+    def stitch_text_blocks(
+        self, text_blocks: List[TextBlock], strip_punctuation: bool = False
+    ) -> tuple[str, list[float]]:
         result = " ".join(block.text for block in text_blocks)
         if strip_punctuation:
             result = result.strip(".,!?;:")
@@ -92,8 +85,37 @@ class StringParser:
 
     def score_match_count(self, text: str, name: str) -> int:
         """Return how many configured phrases for one score appear in text."""
+        return self._configured_match_count(text, name, self.scored_objects(type=ALL))
+
+    def get_breakdown_in_string(self, text: List[TextBlock]):
+        """Return the configured breakdown marker and when it was spoken."""
+        transcript, timestamps = self.stitch_text_blocks(text)
+        words = self.clense_word(transcript).split()
+        matches = []
+
+        for name, breakdown in self.config.get("breakdowns", {}).items():
+            for keyword in breakdown.get("keywords", []):
+                keyword_words = self.clense_word(keyword).split()
+                if not keyword_words:
+                    continue
+                width = len(keyword_words)
+                for start in range(len(words) - width + 1):
+                    if words[start : start + width] == keyword_words:
+                        matches.append((start + width, width, name))
+
+        if not matches:
+            return None, None
+        end, _, name = max(matches, key=lambda match: match[:2])
+        timestamp_index = min(end - 1, len(timestamps) - 1)
+        return name, timestamps[timestamp_index] - self.config.get("stt_latency", 0)
+
+    def breakdown_match_count(self, text: str, name: str) -> int:
+        """Return how many configured phrases for one breakdown appear in text."""
+        return self._configured_match_count(text, name, self.config.get("breakdowns", {}))
+
+    def _configured_match_count(self, text: str, name: str, configured_objects: Dict) -> int:
         words = self.clense_word(text).split()
-        scored_object = self.scored_objects(type=ALL).get(name, {})
+        scored_object = configured_objects.get(name, {})
         count = 0
         for keyword in scored_object.get("keywords", []):
             keyword_words = self.clense_word(keyword).split()

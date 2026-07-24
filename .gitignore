@@ -3,3 +3,11 @@
 .data/
 __pycache__/
 .lprof/
+Analytics/matches/
+Analytics/data/
+data/
+matches/
+*game.json
+*personal.json
+*sqlite3*
+*.log

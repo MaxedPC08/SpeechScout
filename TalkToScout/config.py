@@ -1,7 +1,5 @@
-import json
 from dataclasses import dataclass
-from typing import List, Dict
-import re
+from typing import Dict, List, Optional
 
 @dataclass
 class Period:
@@ -12,7 +10,7 @@ class Period:
 class ScoredObject:
     name: str
     points: int
-    alt_points: int
+    alt_points: Optional[int]
     keywords: List[str]
 
 @dataclass
@@ -27,7 +25,7 @@ class TextBlock:
 @dataclass
 class Team:
     name: str
-    number: float
+    number: int
 
 @dataclass
 class Match:
@@ -35,12 +33,20 @@ class Match:
     competition_name: str
     teams: List[Team]
 
-class GameConfig:
-    def __init__(self, config_path):
-        with open(config_path, "r", encoding="utf-8") as f:
-            self.config = json.load(f)
-    
-    def get_config(self):
-        return self.config
-    
+@dataclass(frozen=True)
+class SpokenWord:
+    word: str
+    said_at: float | str
 
+@dataclass(frozen=True)
+class ScoreEvent:
+    name: str
+    points: int
+    timestamp: float
+    transcript: str
+    alt_points: Optional[int] = None
+
+@dataclass
+class MatchNote:
+    timestamp: float
+    text: str
