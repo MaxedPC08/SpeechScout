@@ -1,38 +1,75 @@
-"""Gemini enrichment for locally stored SpeechScout scouting data.
+"""OpenAI-compatible AI enrichment for locally stored SpeechScout data.
 
-The API key is supplied by the caller and is deliberately never written to the
-database, source JSON, or configuration.  Generated summaries and embeddings
-are cached locally so they remain available after the network is gone.
+The caller supplies the endpoint, model, and API key. Generated summaries and
+embeddings are cached locally so they remain available after the network is
+gone.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import hashlib
 import json
 from pathlib import Path
 import re
 import sqlite3
-from typing import Any, Iterable
+import time
+from typing import Any, Callable, Iterable
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
 
-GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-# This is intentionally a constant rather than a saved user preference: a
-# user can update it in one obvious place when Google retires a model.
-GEMINI_SUMMARY_MODEL = "gemini-3.1-flash-lite"
-GEMINI_EMBEDDING_MODEL = "gemini-embedding-001"
 SUMMARY_PROMPT_VERSION = "match-role-v1"
 EMBEDDING_PROMPT_VERSION = "retrieval-v1"
 MAX_SUMMARY_CHARS = 420
+# A request gets one initial attempt plus this many retries. The wait is capped
+# so a background request cannot leave the desktop UI stuck indefinitely.
+MAX_RATE_LIMIT_RETRIES = 4
+MAX_RATE_LIMIT_WAIT_SECONDS = 60
+# Models occasionally ignore the JSON-only instruction. Retry a bad summary
+# response once, then leave that one work item for a later run.
+MAX_UNUSABLE_SUMMARY_RETRIES = 1
+
+ProgressCallback = Callable[[int, int, str], None]
+StatusCallback = Callable[[str], None]
 
 
 class GeminiEnrichmentError(RuntimeError):
-    """Raised for a recoverable Gemini API or local enrichment failure."""
+    """Raised for a recoverable AI-provider or local enrichment failure."""
+
+
+class UnusableSummaryResponseError(GeminiEnrichmentError):
+    """A model response was malformed or incomplete after its retry."""
+
+
+@dataclass(frozen=True)
+class OpenAICompatibleConfig:
+    """Connection details for a standard OpenAI-compatible REST server."""
+
+    endpoint: str
+    model: str
+    api_key: str
+    embedding_model: str = ""
+
+    def validated(self) -> "OpenAICompatibleConfig":
+        endpoint = self.endpoint.strip().rstrip("/")
+        model = self.model.strip()
+        api_key = self.api_key.strip()
+        if not endpoint.startswith(("http://", "https://")):
+            raise GeminiEnrichmentError("AI endpoint must start with http:// or https://.")
+        if not model:
+            raise GeminiEnrichmentError("Set ai_model in personal.json before generating summaries.")
+        if not api_key:
+            raise GeminiEnrichmentError("Set ai_api_key in personal.json before generating summaries.")
+        return OpenAICompatibleConfig(
+            endpoint=endpoint,
+            model=model,
+            api_key=api_key,
+            embedding_model=self.embedding_model.strip() or model,
+        )
 
 
 @dataclass(frozen=True)
@@ -41,6 +78,8 @@ class EnrichmentReport:
     team_summaries: int
     embedding_chunks: int
     json_files_updated: int
+    skipped_match_batches: int
+    skipped_team_summaries: int
 
 
 @dataclass(frozen=True)
@@ -54,10 +93,8 @@ class TeamSearchResult:
 
 def enrich_database(
     database_path: Path | str,
-    api_key: str,
-    *,
-    summary_model: str = GEMINI_SUMMARY_MODEL,
-    embedding_model: str = GEMINI_EMBEDDING_MODEL,
+    provider: OpenAICompatibleConfig,
+    progress_callback: ProgressCallback | None = None,
 ) -> EnrichmentReport:
     """Generate short summaries and a local semantic-search index.
 
@@ -65,7 +102,7 @@ def enrich_database(
     match, not only the target team's observation.  Team summaries use all of
     that team's imported observations plus the generated match summaries.
     """
-    clean_key = _required_api_key(api_key)
+    provider = provider.validated()
     connection = sqlite3.connect(Path(database_path))
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -77,21 +114,67 @@ def enrich_database(
             raise GeminiEnrichmentError("No event has been imported into the analytics database yet.")
         event_key = str(event["event_key"])
 
-        match_summaries, json_updates = _enrich_match_summaries(
-            connection, clean_key, summary_model
+        _report_progress(progress_callback, 0, 0, "Checking which AI summaries are already current…")
+        completed_work = 0
+        total_work = _pending_match_summary_batch_count(connection)
+        _report_progress(
+            progress_callback,
+            completed_work,
+            total_work,
+            _work_status("Generating match summaries", completed_work, total_work),
         )
-        team_summaries = _enrich_team_summaries(
-            connection, event_key, clean_key, summary_model
+        match_summaries, json_updates, skipped_match_batches = _enrich_match_summaries(
+            connection,
+            provider,
+            progress_callback=progress_callback,
+            completed_work=completed_work,
+            total_work=total_work,
+        )
+        completed_work = total_work
+
+        team_work = _pending_team_summary_count(connection, event_key)
+        total_work += team_work
+        _report_progress(
+            progress_callback,
+            completed_work,
+            total_work,
+            _work_status("Generating team role summaries", 0, team_work),
+        )
+        team_summaries, skipped_team_summaries = _enrich_team_summaries(
+            connection,
+            event_key,
+            provider,
+            progress_callback=progress_callback,
+            completed_work=completed_work,
+            total_work=total_work,
+        )
+        completed_work = total_work
+
+        embedding_work = _pending_embedding_chunk_count(connection, event_key, provider)
+        total_work += embedding_work
+        _report_progress(
+            progress_callback,
+            completed_work,
+            total_work,
+            _work_status("Building the AI search index", 0, embedding_work),
         )
         embedding_chunks = _refresh_embedding_chunks(
-            connection, event_key, clean_key, embedding_model
+            connection,
+            event_key,
+            provider,
+            progress_callback=progress_callback,
+            completed_work=completed_work,
+            total_work=total_work,
         )
         connection.commit()
+        _report_progress(progress_callback, total_work, total_work, "AI summaries and search index are ready.")
         return EnrichmentReport(
             match_summaries=match_summaries,
             team_summaries=team_summaries,
             embedding_chunks=embedding_chunks,
             json_files_updated=json_updates,
+            skipped_match_batches=skipped_match_batches,
+            skipped_team_summaries=skipped_team_summaries,
         )
     except sqlite3.DatabaseError as error:
         connection.rollback()
@@ -102,21 +185,15 @@ def enrich_database(
 
 def search_teams(
     database_path: Path | str,
-    api_key: str,
+    provider: OpenAICompatibleConfig,
     query: str,
-    *,
-    embedding_model: str = GEMINI_EMBEDDING_MODEL,
 ) -> list[TeamSearchResult]:
-    """Rank teams by cached summary embeddings, with match summaries dominant."""
+    """Refresh missing embeddings, then rank teams by summary similarity."""
     clean_query = " ".join(query.split())
     if not clean_query:
         return []
-    query_embedding = _embed_text(
-        _required_api_key(api_key),
-        clean_query,
-        embedding_model,
-        task_type="RETRIEVAL_QUERY",
-    )
+    provider = provider.validated()
+    refresh_search_embeddings(database_path, provider)
     connection = sqlite3.connect(f"{Path(database_path).resolve().as_uri()}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     try:
@@ -131,6 +208,10 @@ def search_teams(
         raise GeminiEnrichmentError(f"Could not read the local search index: {error}") from error
     finally:
         connection.close()
+
+    if not chunks:
+        return []
+    query_embedding = _embed_text(provider, clean_query)
 
     match_scores: dict[int, list[float]] = {}
     role_scores: dict[int, float] = {}
@@ -148,30 +229,81 @@ def search_teams(
 
     results: list[TeamSearchResult] = []
     for team_number in set(match_scores) | set(role_scores):
-        scores = sorted(match_scores.get(team_number, []), reverse=True)
-        # Only clear semantic matches count toward the frequency bonus.  The
-        # average of the best three rewards repeated, high-quality role fits.
-        relevant = [score for score in scores if score >= 0.20]
-        quality = sum(scores[:3]) / min(3, len(scores)) if scores else 0.0
-        frequency = min(len(relevant), 3) / 3
-        match_signal = 0.75 * quality + 0.25 * frequency
+        scores = match_scores.get(team_number, [])
+        # A single excellent match observation should not be diluted by several
+        # unrelated matches. Keep a little of the average to reward repeated
+        # evidence for the requested role.
+        match_signal = (
+            0.70 * max(scores) + 0.30 * (sum(scores) / len(scores))
+            if scores
+            else 0.0
+        )
         role_signal = role_scores.get(team_number)
-        final_score = match_signal if role_signal is None else 0.90 * match_signal + 0.10 * role_signal
+        final_score = (
+            match_signal
+            if role_signal is None
+            else 0.85 * match_signal + 0.15 * role_signal
+        )
         results.append(
             TeamSearchResult(
                 team_number=team_number,
                 score=final_score,
-                match_hits=len(relevant),
+                match_hits=len(scores),
                 best_match_score=max(scores) if scores else -1.0,
                 team_summary_score=role_signal,
             )
         )
-    return sorted(results, key=lambda item: (-item.score, -item.match_hits, item.team_number))
+    return _relevant_team_results(results)
+
+
+def _relevant_team_results(results: Iterable[TeamSearchResult]) -> list[TeamSearchResult]:
+    """Return only the clearest matches instead of every nonzero cosine score."""
+    ranked = sorted(results, key=lambda item: (-item.score, -item.match_hits, item.team_number))
+    if not ranked:
+        return []
+    scores = [item.score for item in ranked]
+    average = sum(scores) / len(scores)
+    spread = (sum((score - average) ** 2 for score in scores) / len(scores)) ** 0.5
+    best_score = ranked[0].score
+    # The score must be meaningfully better than the event's typical result and
+    # close to the best match. Twelve is enough for scouting without burying the
+    # strong candidates in a full event list.
+    threshold = max(0.18, average + 0.35 * spread, best_score - 0.16)
+    relevant = [item for item in ranked if item.score >= threshold]
+    return (relevant or ranked[:1])[:12]
+
+
+def refresh_search_embeddings(
+    database_path: Path | str, provider: OpenAICompatibleConfig
+) -> int:
+    """Generate every missing current-summary embedding before a search runs."""
+    connection = sqlite3.connect(Path(database_path))
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        event = connection.execute(
+            "SELECT event_key FROM events ORDER BY event_key LIMIT 1"
+        ).fetchone()
+        if event is None:
+            raise GeminiEnrichmentError("No event has been imported into the analytics database yet.")
+        created = _refresh_embedding_chunks(connection, str(event["event_key"]), provider)
+        connection.commit()
+        return created
+    except sqlite3.DatabaseError as error:
+        connection.rollback()
+        raise GeminiEnrichmentError(f"Could not update the local search index: {error}") from error
+    finally:
+        connection.close()
 
 
 def _enrich_match_summaries(
-    connection: sqlite3.Connection, api_key: str, model: str
-) -> tuple[int, int]:
+    connection: sqlite3.Connection,
+    provider: OpenAICompatibleConfig,
+    *,
+    progress_callback: ProgressCallback | None = None,
+    completed_work: int = 0,
+    total_work: int = 0,
+) -> tuple[int, int, int]:
     rows = connection.execute(
         """
         SELECT DISTINCT m.match_key, m.match_number
@@ -182,6 +314,8 @@ def _enrich_match_summaries(
     ).fetchall()
     created_summaries = 0
     json_updates = 0
+    skipped_batches = 0
+    current_work = completed_work
     for row in rows:
         match_key = str(row["match_key"])
         context = _match_context(connection, match_key)
@@ -193,14 +327,38 @@ def _enrich_match_summaries(
             if not _summary_exists(connection, "match_team_summaries", match_key, team, source_hash)
         ]
         if pending:
-            summaries = _generate_match_summaries(api_key, model, context, pending)
+            match_number = int(row["match_number"])
+            _report_progress(
+                progress_callback,
+                current_work,
+                total_work,
+                f"Writing match {match_number} contribution summaries…",
+            )
+            try:
+                summaries = _generate_match_summaries(
+                    provider,
+                    context,
+                    pending,
+                    status_callback=lambda message, number=match_number: _report_progress(
+                        progress_callback,
+                        current_work,
+                        total_work,
+                        f"Match {number}: {message}",
+                    ),
+                )
+            except UnusableSummaryResponseError:
+                skipped_batches += 1
+                current_work += 1
+                _report_progress(
+                    progress_callback,
+                    current_work,
+                    total_work,
+                    f"Skipped match {match_number}: its AI response stayed unusable after one retry.",
+                )
+                continue
             now = _utc_now()
             for team_number in pending:
-                summary = summaries.get(team_number)
-                if not summary:
-                    raise GeminiEnrichmentError(
-                        f"Gemini did not return a usable summary for Team {team_number} in Match {row['match_number']}."
-                    )
+                summary = summaries[team_number]
                 connection.execute(
                     """
                     INSERT INTO match_team_summaries(
@@ -213,16 +371,33 @@ def _enrich_match_summaries(
                 json_updates += _store_summary_in_source_json(
                     connection, match_key, team_number, summary
                 )
-    return created_summaries, json_updates
+            # Keep this completed match even if a later request fails.
+            connection.commit()
+            current_work += 1
+            _report_progress(
+                progress_callback,
+                current_work,
+                total_work,
+                f"Finished match {match_number} contribution summaries.",
+            )
+    return created_summaries, json_updates, skipped_batches
 
 
 def _enrich_team_summaries(
-    connection: sqlite3.Connection, event_key: str, api_key: str, model: str
-) -> int:
+    connection: sqlite3.Connection,
+    event_key: str,
+    provider: OpenAICompatibleConfig,
+    *,
+    progress_callback: ProgressCallback | None = None,
+    completed_work: int = 0,
+    total_work: int = 0,
+) -> tuple[int, int]:
     teams = connection.execute(
         "SELECT DISTINCT team_number FROM observations ORDER BY team_number"
     ).fetchall()
     created = 0
+    skipped = 0
+    current_work = completed_work
     for row in teams:
         team_number = int(row["team_number"])
         context = _team_context(connection, team_number)
@@ -236,7 +411,33 @@ def _enrich_team_summaries(
         ).fetchone()
         if exists is not None:
             continue
-        summary = _generate_team_summary(api_key, model, context)
+        _report_progress(
+            progress_callback,
+            current_work,
+            total_work,
+            f"Writing Team {team_number}'s role summary…",
+        )
+        try:
+            summary = _generate_team_summary(
+                provider,
+                context,
+                status_callback=lambda message, number=team_number: _report_progress(
+                    progress_callback,
+                    current_work,
+                    total_work,
+                    f"Team {number}: {message}",
+                ),
+            )
+        except UnusableSummaryResponseError:
+            skipped += 1
+            current_work += 1
+            _report_progress(
+                progress_callback,
+                current_work,
+                total_work,
+                f"Skipped Team {team_number}'s role summary: its AI response stayed unusable after one retry.",
+            )
+            continue
         connection.execute(
             """
             INSERT INTO team_summaries(event_key, team_number, summary, source_hash, prompt_version, generated_at)
@@ -244,25 +445,59 @@ def _enrich_team_summaries(
             """,
             (event_key, team_number, summary, source_hash, SUMMARY_PROMPT_VERSION, _utc_now()),
         )
+        # Keep this completed role summary even if a later request fails.
+        connection.commit()
         created += 1
-    return created
+        current_work += 1
+        _report_progress(
+            progress_callback,
+            current_work,
+            total_work,
+            f"Finished Team {team_number}'s role summary.",
+        )
+    return created, skipped
 
 
 def _refresh_embedding_chunks(
-    connection: sqlite3.Connection, event_key: str, api_key: str, model: str
+    connection: sqlite3.Connection,
+    event_key: str,
+    provider: OpenAICompatibleConfig,
+    *,
+    progress_callback: ProgressCallback | None = None,
+    completed_work: int = 0,
+    total_work: int = 0,
 ) -> int:
     documents = _current_summary_documents(connection, event_key)
     created = 0
+    current_work = completed_work
     for document in documents:
-        source_hash = _hash_text(
-            f"{EMBEDDING_PROMPT_VERSION}|{model}|{document['chunk_type']}|{document['text']}"
-        )
+        source_hash = _embedding_source_hash(provider, document)
         exists = connection.execute(
             "SELECT 1 FROM embedding_chunks WHERE source_hash = ?", (source_hash,)
         ).fetchone()
         if exists is not None:
             continue
-        embedding = _embed_text(api_key, str(document["text"]), model, task_type="RETRIEVAL_DOCUMENT")
+        subject = (
+            f"Match {document['match_key']} / Team {document['team_number']}"
+            if document["match_key"] is not None
+            else f"Team {document['team_number']}"
+        )
+        _report_progress(
+            progress_callback,
+            current_work,
+            total_work,
+            f"Adding {subject} to the AI search index…",
+        )
+        embedding = _embed_text(
+            provider,
+            str(document["text"]),
+            status_callback=lambda message, item=subject: _report_progress(
+                progress_callback,
+                current_work,
+                total_work,
+                f"{item}: {message}",
+            ),
+        )
         connection.execute(
             """
             DELETE FROM embedding_chunks
@@ -290,8 +525,88 @@ def _refresh_embedding_chunks(
                 _utc_now(),
             ),
         )
+        # Keep this completed index item even if a later request fails.
+        connection.commit()
         created += 1
+        current_work += 1
+        _report_progress(
+            progress_callback,
+            current_work,
+            total_work,
+            f"Added {subject} to the AI search index.",
+        )
     return created
+
+
+def _pending_match_summary_batch_count(connection: sqlite3.Connection) -> int:
+    """Count provider calls needed for match summaries without changing data."""
+    rows = connection.execute(
+        """
+        SELECT DISTINCT m.match_key
+        FROM matches AS m
+        JOIN observations AS o ON o.match_key = m.match_key
+        ORDER BY m.match_number
+        """
+    ).fetchall()
+    pending_batches = 0
+    for row in rows:
+        match_key = str(row["match_key"])
+        context = _match_context(connection, match_key)
+        source_hash = _hash_json(context)
+        for team_number in {int(item["team_number"]) for item in context["observations"]}:
+            if not _summary_exists(
+                connection, "match_team_summaries", match_key, team_number, source_hash
+            ):
+                pending_batches += 1
+                break
+    return pending_batches
+
+
+def _pending_team_summary_count(connection: sqlite3.Connection, event_key: str) -> int:
+    """Count role summaries that will require a provider call."""
+    teams = connection.execute(
+        "SELECT DISTINCT team_number FROM observations ORDER BY team_number"
+    ).fetchall()
+    pending = 0
+    for row in teams:
+        team_number = int(row["team_number"])
+        source_hash = _hash_json(_team_context(connection, team_number))
+        exists = connection.execute(
+            """
+            SELECT 1 FROM team_summaries
+            WHERE event_key = ? AND team_number = ? AND source_hash = ?
+            """,
+            (event_key, team_number, source_hash),
+        ).fetchone()
+        if exists is None:
+            pending += 1
+    return pending
+
+
+def _pending_embedding_chunk_count(
+    connection: sqlite3.Connection,
+    event_key: str,
+    provider: OpenAICompatibleConfig,
+) -> int:
+    """Count summaries whose current text has not been embedded yet."""
+    pending = 0
+    for document in _current_summary_documents(connection, event_key):
+        exists = connection.execute(
+            "SELECT 1 FROM embedding_chunks WHERE source_hash = ?",
+            (_embedding_source_hash(provider, document),),
+        ).fetchone()
+        if exists is None:
+            pending += 1
+    return pending
+
+
+def _embedding_source_hash(
+    provider: OpenAICompatibleConfig, document: dict[str, Any]
+) -> str:
+    return _hash_text(
+        f"{EMBEDDING_PROMPT_VERSION}|{provider.endpoint}|{provider.embedding_model}|"
+        f"{document['chunk_type']}|{document['text']}"
+    )
 
 
 def _current_summary_documents(
@@ -479,20 +794,47 @@ def _observation_context(connection: sqlite3.Connection, observation: sqlite3.Ro
 
 
 def _generate_match_summaries(
-    api_key: str, model: str, context: dict[str, Any], teams: Iterable[int]
+    provider: OpenAICompatibleConfig,
+    context: dict[str, Any],
+    teams: Iterable[int],
+    *,
+    status_callback: StatusCallback | None = None,
 ) -> dict[int, str]:
+    requested_teams = list(teams)
     prompt = (
         "You are writing concise, evidence-grounded FRC scouting notes. "
         "The JSON below contains the complete imported context for one match: every team's "
         "score events and scout notes. Write one 1–2 sentence summary for each requested team, "
-        "describing its actual contribution. Mention observed scoring levels/timing, defense, "
-        "breakdowns, and penalties only when the supplied records support them. Do not infer or "
+        "describing its actual contribution. Mention observed defense, "
+        "breakdowns, and penalties only when the supplied records support them. Focus on qualitative information about"
+        "the robots, as we already track scoring. If the bot played defense, detail how and how effectively. Do not infer or "
         "invent missing behavior. Return JSON only in this exact shape: "
         '{"summaries":[{"team_number":123,"summary":"..."}]}. '
-        f"Requested teams: {list(teams)}\n\nMatch context:\n{json.dumps(context, separators=(',', ':'))}"
+        f"Requested teams: {requested_teams}\n\nMatch context:\n{json.dumps(context, separators=(',', ':'))}"
     )
-    payload = _generate_json(api_key, model, prompt)
-    raw_items = payload.get("summaries") if isinstance(payload, dict) else None
+    for retry_count in range(MAX_UNUSABLE_SUMMARY_RETRIES + 1):
+        try:
+            payload = _generate_json(provider, prompt, status_callback=status_callback)
+            summaries = _match_summaries_from_payload(payload)
+            missing_teams = [team for team in requested_teams if team not in summaries]
+            if missing_teams:
+                raise UnusableSummaryResponseError(
+                    "The AI provider did not return every requested match summary."
+                )
+            return {team: summaries[team] for team in requested_teams}
+        except UnusableSummaryResponseError:
+            if retry_count >= MAX_UNUSABLE_SUMMARY_RETRIES:
+                raise
+            _report_status(
+                status_callback,
+                "The AI provider returned an incomplete or unreadable match summary. "
+                f"Retrying once…",
+            )
+    raise AssertionError("The summary retry loop should always return or raise.")
+
+
+def _match_summaries_from_payload(payload: dict[str, Any]) -> dict[int, str]:
+    raw_items = payload.get("summaries")
     summaries: dict[int, str] = {}
     if isinstance(raw_items, list):
         for item in raw_items:
@@ -502,7 +844,7 @@ def _generate_match_summaries(
             text = _clean_summary(item.get("summary"))
             if team_number is not None and text:
                 summaries[team_number] = text
-    if not summaries and isinstance(payload, dict):
+    if not summaries:
         # Gracefully accept a direct {"123": "summary"} response as well.
         for key, value in payload.items():
             team_number = _integer(key)
@@ -512,7 +854,12 @@ def _generate_match_summaries(
     return summaries
 
 
-def _generate_team_summary(api_key: str, model: str, context: dict[str, Any]) -> str:
+def _generate_team_summary(
+    provider: OpenAICompatibleConfig,
+    context: dict[str, Any],
+    *,
+    status_callback: StatusCallback | None = None,
+) -> str:
     prompt = (
         "You are writing a concise FRC team role summary from scouting evidence. "
         "Use every supplied match summary, score event, and note. Describe the team's recurring "
@@ -521,90 +868,203 @@ def _generate_team_summary(api_key: str, model: str, context: dict[str, Any]) ->
         '{"summary":"..."}. Keep the summary to at most two sentences.\n\nTeam context:\n'
         f"{json.dumps(context, separators=(',', ':'))}"
     )
-    payload = _generate_json(api_key, model, prompt)
-    summary = _clean_summary(payload.get("summary") if isinstance(payload, dict) else None)
-    if not summary:
-        raise GeminiEnrichmentError("Gemini returned no usable team role summary.")
-    return summary
+    for retry_count in range(MAX_UNUSABLE_SUMMARY_RETRIES + 1):
+        try:
+            payload = _generate_json(provider, prompt, status_callback=status_callback)
+            summary = _clean_summary(payload.get("summary"))
+            if not summary:
+                raise UnusableSummaryResponseError(
+                    "The AI provider returned no usable team role summary."
+                )
+            return summary
+        except UnusableSummaryResponseError:
+            if retry_count >= MAX_UNUSABLE_SUMMARY_RETRIES:
+                raise
+            _report_status(
+                status_callback,
+                "The AI provider returned an incomplete or unreadable role summary. Retrying once…",
+            )
+    raise AssertionError("The summary retry loop should always return or raise.")
 
 
-def _generate_json(api_key: str, model: str, prompt: str) -> dict[str, Any]:
-    payload = _post_gemini(
-        api_key,
-        f"models/{quote(model, safe='.-_')}:generateContent",
-        {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.15,
-                "maxOutputTokens": 700,
-                "responseMimeType": "application/json",
+def _generate_json(
+    provider: OpenAICompatibleConfig,
+    prompt: str,
+    *,
+    status_callback: StatusCallback | None = None,
+) -> dict[str, Any]:
+    request_payload = {
+        "model": provider.model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Return only valid JSON. Do not use Markdown fences.",
             },
-        },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.15,
+        "max_tokens": 700,
+    }
+    payload = _post_openai_compatible(
+        provider,
+        "chat/completions",
+        request_payload,
+        status_callback=status_callback,
     )
-    try:
-        text = "".join(
-            str(part.get("text", ""))
-            for part in payload["candidates"][0]["content"]["parts"]
-            if isinstance(part, dict)
+    parsed = _read_summary_json(payload)
+    if parsed is None:
+        raise UnusableSummaryResponseError(
+            "The AI provider returned an unreadable summary response."
         )
-        parsed = json.loads(text)
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
-        raise GeminiEnrichmentError("Gemini returned an unreadable summary response.") from error
-    if not isinstance(parsed, dict):
-        raise GeminiEnrichmentError("Gemini returned a summary response in an unexpected format.")
     return parsed
 
 
-def _embed_text(api_key: str, text: str, model: str, *, task_type: str) -> list[float]:
-    payload = _post_gemini(
-        api_key,
-        f"models/{quote(model, safe='.-_')}:embedContent",
+def _read_summary_json(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract JSON from common OpenAI-compatible chat response shapes."""
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    if isinstance(content, str):
+        text = content.strip()
+    elif isinstance(content, list):
+        text = "".join(
+            str(part.get("text", "")) for part in content if isinstance(part, dict)
+        ).strip()
+    else:
+        return None
+    fenced_json = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.IGNORECASE | re.DOTALL)
+    if fenced_json is not None:
+        text = fenced_json.group(1)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _embed_text(
+    provider: OpenAICompatibleConfig,
+    text: str,
+    *,
+    status_callback: StatusCallback | None = None,
+) -> list[float]:
+    payload = _post_openai_compatible(
+        provider,
+        "embeddings",
         {
-            "content": {"parts": [{"text": text}]},
-            "taskType": task_type,
+            "model": provider.embedding_model,
+            "input": text,
+            "encoding_format": "float",
         },
+        status_callback=status_callback,
     )
     try:
-        values = payload["embedding"]["values"]
+        values = payload["data"][0]["embedding"]
         embedding = [float(value) for value in values]
     except (KeyError, TypeError, ValueError) as error:
-        raise GeminiEnrichmentError("Gemini returned an unreadable embedding response.") from error
+        raise GeminiEnrichmentError("The AI provider returned an unreadable embedding response.") from error
     if not embedding:
-        raise GeminiEnrichmentError("Gemini returned an empty embedding.")
+        raise GeminiEnrichmentError("The AI provider returned an empty embedding.")
     return embedding
 
 
-def _post_gemini(api_key: str, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
-    request = Request(
-        f"{GEMINI_API_BASE_URL}/{endpoint}",
-        data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": api_key,
-            "User-Agent": "SpeechScout Analytics/1.0",
-        },
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=45) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except HTTPError as error:
-        if error.code in {401, 403}:
-            message = "Gemini rejected that API key. Check the key and try again."
-        elif error.code == 404:
-            message = "Gemini could not find the configured model. Check its availability for this API key."
-        elif error.code == 429:
-            message = "Gemini rate limited this request. Wait briefly and try again."
-        else:
-            message = f"Gemini returned HTTP {error.code}."
-        raise GeminiEnrichmentError(message) from error
-    except (URLError, TimeoutError, OSError) as error:
-        raise GeminiEnrichmentError("Could not reach Gemini. Check the network connection and try again.") from error
-    except (json.JSONDecodeError, UnicodeDecodeError) as error:
-        raise GeminiEnrichmentError("Gemini returned an unreadable response.") from error
+def _post_openai_compatible(
+    provider: OpenAICompatibleConfig,
+    route: str,
+    payload: dict[str, Any],
+    *,
+    status_callback: StatusCallback | None = None,
+) -> dict[str, Any]:
+    for retry_count in range(MAX_RATE_LIMIT_RETRIES + 1):
+        request = Request(
+            f"{provider.endpoint}/{route}",
+            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {provider.api_key}",
+                "User-Agent": "SpeechScout Analytics/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=45) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            if error.code == 429 and retry_count < MAX_RATE_LIMIT_RETRIES:
+                delay_seconds = _rate_limit_delay_seconds(error, retry_count)
+                _report_status(
+                    status_callback,
+                    "Rate limited by the AI provider. Retrying in "
+                    f"{delay_seconds} second{'s' if delay_seconds != 1 else ''} "
+                    f"(retry {retry_count + 1} of {MAX_RATE_LIMIT_RETRIES})…",
+                )
+                time.sleep(delay_seconds)
+                continue
+            if error.code in {401, 403}:
+                message = "The AI provider rejected that API key. Check the key and try again."
+            elif error.code == 404:
+                message = "The AI provider could not find the endpoint or configured model."
+            elif error.code == 429:
+                message = (
+                    "The AI provider is still rate limiting requests after "
+                    f"{MAX_RATE_LIMIT_RETRIES} retries. Wait a few minutes and try again."
+                )
+            else:
+                message = f"The AI provider returned HTTP {error.code}."
+            raise GeminiEnrichmentError(message) from error
+        except (URLError, TimeoutError, OSError) as error:
+            raise GeminiEnrichmentError(
+                "Could not reach the AI endpoint. Check the endpoint and network connection."
+            ) from error
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise GeminiEnrichmentError("The AI provider returned an unreadable response.") from error
+        break
     if not isinstance(result, dict):
-        raise GeminiEnrichmentError("Gemini returned an unexpected response.")
+        raise GeminiEnrichmentError("The AI provider returned an unexpected response.")
     return result
+
+
+def _rate_limit_delay_seconds(error: HTTPError, retry_count: int) -> int:
+    """Use a provider's Retry-After hint, with a bounded exponential fallback."""
+    retry_after = error.headers.get("Retry-After") if error.headers is not None else None
+    if retry_after:
+        try:
+            return _bounded_wait_seconds(float(retry_after))
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                seconds_until_retry = (retry_at - datetime.now(timezone.utc)).total_seconds()
+                return _bounded_wait_seconds(seconds_until_retry)
+            except (TypeError, ValueError, IndexError, OverflowError):
+                pass
+    return min(MAX_RATE_LIMIT_WAIT_SECONDS, 2 ** (retry_count + 1))
+
+
+def _bounded_wait_seconds(seconds: float) -> int:
+    if seconds != seconds:  # NaN is not a usable delay.
+        raise ValueError("Retry-After was not a number.")
+    return max(1, min(MAX_RATE_LIMIT_WAIT_SECONDS, int(seconds + 0.999)))
+
+
+def _report_progress(
+    callback: ProgressCallback | None, completed: int, total: int, message: str
+) -> None:
+    if callback is not None:
+        callback(max(0, completed), max(0, total), message)
+
+
+def _report_status(callback: StatusCallback | None, message: str) -> None:
+    if callback is not None:
+        callback(message)
+
+
+def _work_status(label: str, completed: int, total: int) -> str:
+    if total == 0:
+        return f"{label}: nothing new to generate."
+    return f"{label} ({completed} of {total})…"
 
 
 def _store_summary_in_source_json(
@@ -658,13 +1118,6 @@ def _summary_exists(
         (match_key, team_number, source_hash),
     ).fetchone()
     return row is not None
-
-
-def _required_api_key(api_key: str) -> str:
-    clean_key = api_key.strip()
-    if not clean_key:
-        raise GeminiEnrichmentError("A Gemini API key is required for summaries and semantic search.")
-    return clean_key
 
 
 def _clean_summary(value: Any) -> str | None:

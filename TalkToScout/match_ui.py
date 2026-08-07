@@ -291,6 +291,15 @@ class MatchApp:
         self._render_microphone_status()
         ttk.Button(score_card, text="End match", style="Danger.TButton", command=self._stop_match).grid(row=0, column=1, rowspan=2, sticky="e")
 
+        self.robot_broken_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            score_card,
+            text="Robot is broken",
+            variable=self.robot_broken_var,
+            command=self._set_robot_broken,
+            style="Toggle.TCheckbutton",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
         self.show_events_var = tk.BooleanVar(value=True)
         self.show_notes_var = tk.BooleanVar(value=True)
         visibility_controls = ttk.Frame(self.page, style="App.TFrame")
@@ -398,8 +407,12 @@ class MatchApp:
         label.configure(text=text, foreground=color)
 
     def _stop_match(self) -> None:
+        self.handler.set_robot_broken(self.robot_broken_var.get())
         self.handler.stop_match()
         self._show_setup()
+
+    def _set_robot_broken(self) -> None:
+        self.handler.set_robot_broken(self.robot_broken_var.get())
 
     def _refresh(self) -> None:
         if self._closing:

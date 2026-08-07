@@ -22,12 +22,12 @@ import re
 import sqlite3
 from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 10
 PROJECT_DIRECTORY = Path(__file__).resolve().parents[1]
 ANALYTICS_DIRECTORY = Path(__file__).resolve().parent
 DEFAULT_DATABASE_PATH = ANALYTICS_DIRECTORY / "speechscout.sqlite3"
@@ -35,6 +35,7 @@ DEFAULT_GAME_CONFIG_PATH = ANALYTICS_DIRECTORY / "game.json"
 DEFAULT_SCHEDULE_PATH = PROJECT_DIRECTORY / "data" / "match_schedule.json"
 DEFAULT_MATCHES_DIRECTORY = PROJECT_DIRECTORY / "matches"
 TBA_API_BASE_URL = "https://www.thebluealliance.com/api/v3"
+STATBOTICS_API_BASE_URL = "https://api.statbotics.io/v3"
 
 LEGACY_FILE_PATTERN = re.compile(r"_(?P<team>\d+)_(?P<match>\d+)\.json$")
 
@@ -117,6 +118,7 @@ CREATE TABLE IF NOT EXISTS observations (
     team_number INTEGER NOT NULL REFERENCES teams(team_number),
     scout_id TEXT NOT NULL REFERENCES scouts(scout_id),
     predicted_winner TEXT CHECK(predicted_winner IN ('red', 'blue')),
+    robot_broken INTEGER NOT NULL DEFAULT 0 CHECK(robot_broken IN (0, 1)),
     reported_total_points INTEGER,
     source_schema_version INTEGER NOT NULL,
     schedule_alignment TEXT NOT NULL
@@ -180,6 +182,62 @@ CREATE TABLE IF NOT EXISTS embedding_chunks (
     created_at TEXT NOT NULL
 );
 
+-- Statbotics is an optional online enrichment. Values are cached locally so
+-- EPA stays available after the dashboard goes offline.
+CREATE TABLE IF NOT EXISTS statbotics_team_epa (
+    event_key TEXT NOT NULL REFERENCES events(event_key),
+    team_number INTEGER NOT NULL REFERENCES teams(team_number),
+    total_epa REAL NOT NULL,
+    auto_epa REAL,
+    teleop_epa REAL,
+    endgame_epa REAL,
+    synced_at TEXT NOT NULL,
+    PRIMARY KEY (event_key, team_number)
+);
+
+-- Official current-event standings, refreshed with TBA qualification results.
+CREATE TABLE IF NOT EXISTS event_rankings (
+    event_key TEXT NOT NULL REFERENCES events(event_key),
+    team_number INTEGER NOT NULL REFERENCES teams(team_number),
+    official_rank INTEGER,
+    ranking_points REAL,
+    ranking_points_label TEXT,
+    matches_played INTEGER,
+    wins INTEGER,
+    losses INTEGER,
+    ties INTEGER,
+    synced_at TEXT NOT NULL,
+    PRIMARY KEY (event_key, team_number)
+);
+
+CREATE TABLE IF NOT EXISTS pick_lists (
+    list_id TEXT PRIMARY KEY,
+    event_key TEXT NOT NULL REFERENCES events(event_key),
+    scout_id TEXT NOT NULL REFERENCES scouts(scout_id),
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(event_key, scout_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS pick_list_teams (
+    list_id TEXT NOT NULL REFERENCES pick_lists(list_id) ON DELETE CASCADE,
+    team_number INTEGER NOT NULL REFERENCES teams(team_number),
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (list_id, team_number)
+);
+
+-- Event-level alliance selection tracking. A team can only be selected once,
+-- but an alliance captain can come from anywhere in the standings.
+CREATE TABLE IF NOT EXISTS alliance_selections (
+    event_key TEXT NOT NULL REFERENCES events(event_key),
+    team_number INTEGER NOT NULL REFERENCES teams(team_number),
+    alliance_number INTEGER NOT NULL CHECK(alliance_number BETWEEN 1 AND 8),
+    selection_kind TEXT NOT NULL CHECK(selection_kind IN ('captain', 'pick')),
+    selected_at TEXT NOT NULL,
+    PRIMARY KEY (event_key, team_number)
+);
+
 CREATE INDEX IF NOT EXISTS idx_matches_event_number
     ON matches(event_key, match_type, match_number);
 CREATE INDEX IF NOT EXISTS idx_match_teams_team
@@ -192,6 +250,14 @@ CREATE INDEX IF NOT EXISTS idx_score_events_observation_time
     ON score_events(observation_id, timestamp_ms);
 CREATE INDEX IF NOT EXISTS idx_notes_observation_time
     ON notes(observation_id, timestamp_ms);
+CREATE INDEX IF NOT EXISTS idx_statbotics_team_epa_event_total
+    ON statbotics_team_epa(event_key, total_epa DESC);
+CREATE INDEX IF NOT EXISTS idx_event_rankings_event_rank
+    ON event_rankings(event_key, official_rank);
+CREATE INDEX IF NOT EXISTS idx_pick_lists_event_scout
+    ON pick_lists(event_key, scout_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alliance_selections_event_alliance
+    ON alliance_selections(event_key, alliance_number, selected_at);
 
 CREATE VIEW IF NOT EXISTS v_team_match_totals AS
 SELECT
@@ -335,9 +401,130 @@ ALTER TABLE matches ADD COLUMN red_penalty_points INTEGER;
 ALTER TABLE matches ADD COLUMN blue_penalty_points INTEGER;
 """
 
+MIGRATION_6_SQL = """
+CREATE TABLE IF NOT EXISTS statbotics_team_epa (
+    event_key TEXT NOT NULL REFERENCES events(event_key),
+    team_number INTEGER NOT NULL REFERENCES teams(team_number),
+    total_epa REAL NOT NULL,
+    auto_epa REAL,
+    teleop_epa REAL,
+    endgame_epa REAL,
+    synced_at TEXT NOT NULL,
+    PRIMARY KEY (event_key, team_number)
+);
+CREATE INDEX IF NOT EXISTS idx_statbotics_team_epa_event_total
+    ON statbotics_team_epa(event_key, total_epa DESC);
+"""
+
+MIGRATION_7_SQL = """
+CREATE TABLE IF NOT EXISTS pick_lists (
+    list_id TEXT PRIMARY KEY,
+    event_key TEXT NOT NULL REFERENCES events(event_key),
+    scout_id TEXT NOT NULL REFERENCES scouts(scout_id),
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(event_key, scout_id, name)
+);
+CREATE TABLE IF NOT EXISTS pick_list_teams (
+    list_id TEXT NOT NULL REFERENCES pick_lists(list_id) ON DELETE CASCADE,
+    team_number INTEGER NOT NULL REFERENCES teams(team_number),
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (list_id, team_number)
+);
+CREATE INDEX IF NOT EXISTS idx_pick_lists_event_scout
+    ON pick_lists(event_key, scout_id, updated_at DESC);
+"""
+
+MIGRATION_8_SQL = """
+CREATE TABLE IF NOT EXISTS event_rankings (
+    event_key TEXT NOT NULL REFERENCES events(event_key),
+    team_number INTEGER NOT NULL REFERENCES teams(team_number),
+    official_rank INTEGER,
+    ranking_points REAL,
+    ranking_points_label TEXT,
+    matches_played INTEGER,
+    wins INTEGER,
+    losses INTEGER,
+    ties INTEGER,
+    synced_at TEXT NOT NULL,
+    PRIMARY KEY (event_key, team_number)
+);
+CREATE INDEX IF NOT EXISTS idx_event_rankings_event_rank
+    ON event_rankings(event_key, official_rank);
+"""
+
+MIGRATION_9_SQL = """
+CREATE INDEX IF NOT EXISTS idx_team_summaries_team_generated
+    ON team_summaries(team_number, generated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_match_team_summaries_lookup
+    ON match_team_summaries(match_key, team_number, generated_at DESC);
+"""
+
+MIGRATION_10_SQL = """
+CREATE TABLE IF NOT EXISTS alliance_selections (
+    event_key TEXT NOT NULL REFERENCES events(event_key),
+    team_number INTEGER NOT NULL REFERENCES teams(team_number),
+    alliance_number INTEGER NOT NULL CHECK(alliance_number BETWEEN 1 AND 8),
+    selection_kind TEXT NOT NULL CHECK(selection_kind IN ('captain', 'pick')),
+    selected_at TEXT NOT NULL,
+    PRIMARY KEY (event_key, team_number)
+);
+CREATE INDEX IF NOT EXISTS idx_alliance_selections_event_alliance
+    ON alliance_selections(event_key, alliance_number, selected_at);
+"""
+
+MIGRATION_11_SQL = """
+ALTER TABLE observations ADD COLUMN robot_broken INTEGER NOT NULL DEFAULT 0
+    CHECK(robot_broken IN (0, 1));
+"""
+
 
 class ResultSyncError(RuntimeError):
     """Raised when official-match sync cannot safely update the local database."""
+
+
+class StatboticsSyncError(RuntimeError):
+    """Raised when Statbotics EPA data cannot safely update the local cache."""
+
+
+class PickListError(RuntimeError):
+    """Raised when a scout pick list cannot safely update."""
+
+
+class TeamSummaryError(RuntimeError):
+    """Raised when an edited team role summary cannot be saved."""
+
+
+@dataclass(frozen=True)
+class StatboticsSyncReport:
+    event_key: str
+    teams_updated: int
+
+
+@dataclass(frozen=True)
+class PickListAddResult:
+    list_name: str
+    team_added: bool
+
+
+def ensure_dashboard_schema(database_path: Path | str) -> None:
+    """Make optional dashboard caches available to existing databases."""
+    connection = sqlite3.connect(Path(database_path))
+    try:
+        with connection:
+            connection.executescript(MIGRATION_6_SQL)
+            connection.executescript(MIGRATION_7_SQL)
+            connection.executescript(MIGRATION_8_SQL)
+            connection.executescript(MIGRATION_9_SQL)
+            connection.executescript(MIGRATION_10_SQL)
+    finally:
+        connection.close()
+
+
+def ensure_statbotics_schema(database_path: Path | str) -> None:
+    """Backward-compatible alias for the dashboard schema initializer."""
+    ensure_dashboard_schema(database_path)
 
 
 def sync_official_results_from_tba(
@@ -382,10 +569,37 @@ def sync_official_results_from_tba(
     if not isinstance(payload, list):
         raise ResultSyncError("TBA returned an unexpected match-results response.")
 
+    rankings_request = Request(
+        f"{TBA_API_BASE_URL}/event/{quote(cleaned_event_key, safe='')}/rankings",
+        headers={
+            "X-TBA-Auth-Key": cleaned_api_key,
+            "Accept": "application/json",
+            "User-Agent": "SpeechScout Analytics/1.0",
+        },
+    )
+    try:
+        with urlopen(rankings_request, timeout=15) as response:
+            rankings_payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        # TBA returns 404 before an event has standings. Match-result syncing
+        # should still work in that situation, and any last-known standings are
+        # retained until official rankings become available.
+        if error.code == 404:
+            rankings_payload = None
+        elif error.code in {401, 403}:
+            raise ResultSyncError("TBA rejected that API key. Check the key and try again.") from error
+        else:
+            raise ResultSyncError(f"TBA returned HTTP {error.code} for event rankings.") from error
+    except (URLError, TimeoutError, OSError) as error:
+        raise ResultSyncError("Could not reach TBA. Check the network connection and try again.") from error
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ResultSyncError("TBA returned an unreadable rankings response.") from error
+
     connection = sqlite3.connect(Path(database_path))
     updated_matches = 0
     try:
         connection.execute("PRAGMA foreign_keys = ON")
+        connection.executescript(MIGRATION_8_SQL)
         with connection:
             for remote_match in payload:
                 if not isinstance(remote_match, dict) or remote_match.get("comp_level") != "qm":
@@ -449,11 +663,412 @@ def sync_official_results_from_tba(
                     ),
                 )
                 updated_matches += cursor.rowcount
+            _cache_event_rankings(connection, cleaned_event_key, rankings_payload)
     except sqlite3.DatabaseError as error:
         raise ResultSyncError(f"Could not update the local results database: {error}") from error
     finally:
         connection.close()
     return updated_matches
+
+
+def _cache_event_rankings(
+    connection: sqlite3.Connection,
+    event_key: str,
+    payload: Any,
+) -> None:
+    """Store official TBA ranks without guessing game-specific ranking rules."""
+    if not isinstance(payload, dict):
+        return
+    rankings = payload.get("rankings")
+    if not isinstance(rankings, list):
+        return
+    local_teams = {
+        int(row[0]) for row in connection.execute("SELECT team_number FROM teams")
+    }
+    ranking_field = _ranking_points_field(payload)
+    rows: list[tuple[Any, ...]] = []
+    for ranking in rankings:
+        if not isinstance(ranking, dict):
+            continue
+        team_key = str(ranking.get("team_key") or "")
+        team_number = integer(team_key.removeprefix("frc"))
+        if team_number is None or team_number not in local_teams:
+            continue
+        record = ranking.get("record")
+        if not isinstance(record, dict):
+            record = {}
+        ranking_points = None
+        ranking_points_label = None
+        if ranking_field is not None:
+            values_key, value_index, field_label = ranking_field
+            values = ranking.get(values_key)
+            if isinstance(values, list) and value_index < len(values):
+                ranking_points = _finite_float(values[value_index])
+                if ranking_points is not None:
+                    ranking_points_label = field_label
+        rows.append(
+            (
+                event_key,
+                team_number,
+                integer(ranking.get("rank")),
+                ranking_points,
+                ranking_points_label,
+                integer(ranking.get("matches_played")),
+                integer(record.get("wins")),
+                integer(record.get("losses")),
+                integer(record.get("ties")),
+                utc_now(),
+            )
+        )
+    connection.execute("DELETE FROM event_rankings WHERE event_key = ?", (event_key,))
+    connection.executemany(
+        """
+        INSERT INTO event_rankings(
+            event_key, team_number, official_rank, ranking_points, ranking_points_label,
+            matches_played, wins, losses, ties, synced_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+
+def _ranking_points_field(payload: dict[str, Any]) -> tuple[str, int, str] | None:
+    """Find TBA's ranking-points field from its event-specific metadata."""
+    candidates: list[tuple[int, str, int, str]] = []
+    for metadata_key, values_key in (
+        ("extra_stats_info", "extra_stats"),
+        ("sort_order_info", "sort_orders"),
+    ):
+        metadata = payload.get(metadata_key)
+        if not isinstance(metadata, list):
+            continue
+        for index, field in enumerate(metadata):
+            if not isinstance(field, dict):
+                continue
+            field_name = str(field.get("name") or "").strip()
+            normalized = " ".join(field_name.casefold().replace("_", " ").split())
+            if "total ranking point" in normalized:
+                priority = 0
+            elif "ranking point" in normalized or "rank point" in normalized:
+                priority = 1
+            elif "ranking score" in normalized:
+                priority = 2
+            else:
+                continue
+            candidates.append((priority, values_key, index, field_name))
+    if not candidates:
+        return None
+    _, values_key, index, field_name = min(candidates, key=lambda item: item[0])
+    return values_key, index, field_name
+
+
+def sync_statbotics_epa(
+    database_path: Path | str,
+    event_key: str,
+) -> StatboticsSyncReport:
+    """Fetch this event's Statbotics EPA values and cache them locally."""
+    cleaned_event_key = event_key.strip()
+    if not cleaned_event_key:
+        raise StatboticsSyncError("The local database does not contain a Statbotics event key.")
+
+    query = urlencode({"event": cleaned_event_key, "limit": 1000})
+    request = Request(
+        f"{STATBOTICS_API_BASE_URL}/team_events?{query}",
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "SpeechScout Analytics/1.0",
+        },
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        if error.code == 404:
+            message = f"Statbotics has no data for event {cleaned_event_key}."
+        elif error.code == 429:
+            message = "Statbotics rate limited this sync. Wait briefly and try again."
+        else:
+            message = f"Statbotics returned HTTP {error.code}."
+        raise StatboticsSyncError(message) from error
+    except (URLError, TimeoutError, OSError) as error:
+        raise StatboticsSyncError(
+            "Could not reach Statbotics. Check the network connection and try again."
+        ) from error
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise StatboticsSyncError("Statbotics returned an unreadable response.") from error
+
+    if not isinstance(payload, list):
+        raise StatboticsSyncError("Statbotics returned an unexpected event-EPA response.")
+
+    connection = sqlite3.connect(Path(database_path))
+    updated = 0
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.executescript(MIGRATION_6_SQL)
+        local_teams = {
+            int(row[0])
+            for row in connection.execute("SELECT team_number FROM teams")
+        }
+        with connection:
+            for item in payload:
+                values = _statbotics_epa_values(item)
+                if values is None:
+                    continue
+                team_number, total_epa, auto_epa, teleop_epa, endgame_epa = values
+                if team_number not in local_teams:
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO statbotics_team_epa(
+                        event_key, team_number, total_epa, auto_epa, teleop_epa, endgame_epa, synced_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(event_key, team_number) DO UPDATE SET
+                        total_epa = excluded.total_epa,
+                        auto_epa = excluded.auto_epa,
+                        teleop_epa = excluded.teleop_epa,
+                        endgame_epa = excluded.endgame_epa,
+                        synced_at = excluded.synced_at
+                    """,
+                    (
+                        cleaned_event_key,
+                        team_number,
+                        total_epa,
+                        auto_epa,
+                        teleop_epa,
+                        endgame_epa,
+                        utc_now(),
+                    ),
+                )
+                updated += 1
+    except sqlite3.DatabaseError as error:
+        raise StatboticsSyncError(f"Could not update the local EPA cache: {error}") from error
+    finally:
+        connection.close()
+    return StatboticsSyncReport(event_key=cleaned_event_key, teams_updated=updated)
+
+
+def _statbotics_epa_values(
+    item: Any,
+) -> tuple[int, float, float | None, float | None, float | None] | None:
+    """Read the stable score-EPA fields from a Statbotics team-event record."""
+    if not isinstance(item, dict):
+        return None
+    team_number = integer(item.get("team"))
+    epa = item.get("epa")
+    if team_number is None or not isinstance(epa, dict):
+        return None
+    total_points = epa.get("total_points")
+    breakdown = epa.get("breakdown")
+    total_epa = (
+        _finite_float(total_points.get("mean"))
+        if isinstance(total_points, dict)
+        else None
+    )
+    if total_epa is None and isinstance(breakdown, dict):
+        total_epa = _finite_float(breakdown.get("total_points"))
+    if total_epa is None:
+        return None
+    return (
+        team_number,
+        total_epa,
+        _finite_float(breakdown.get("auto_points")) if isinstance(breakdown, dict) else None,
+        _finite_float(breakdown.get("teleop_points")) if isinstance(breakdown, dict) else None,
+        _finite_float(breakdown.get("endgame_points")) if isinstance(breakdown, dict) else None,
+    )
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and number not in {float("inf"), float("-inf")} else None
+
+
+def add_team_to_pick_list(
+    database_path: Path | str,
+    event_key: str,
+    scout_id: str,
+    list_name: str,
+    team_number: int,
+) -> PickListAddResult:
+    """Create or reuse a scout's event pick list and add one team to it."""
+    clean_event_key = event_key.strip()
+    clean_scout_id = scout_id.strip()
+    clean_name = " ".join(list_name.split())
+    if not clean_event_key or not clean_scout_id or not clean_name:
+        raise PickListError("Choose a scout and give the pick list a name.")
+    if team_number <= 0:
+        raise PickListError("Pick lists can only contain valid team numbers.")
+
+    connection = sqlite3.connect(Path(database_path))
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.executescript(MIGRATION_7_SQL)
+        with connection:
+            event_exists = connection.execute(
+                "SELECT 1 FROM events WHERE event_key = ?", (clean_event_key,)
+            ).fetchone()
+            scout_exists = connection.execute(
+                "SELECT 1 FROM scouts WHERE scout_id = ?", (clean_scout_id,)
+            ).fetchone()
+            team_exists = connection.execute(
+                "SELECT 1 FROM teams WHERE team_number = ?", (team_number,)
+            ).fetchone()
+            if event_exists is None or scout_exists is None or team_exists is None:
+                raise PickListError("The selected event, scout, or team is no longer in this database.")
+
+            existing = connection.execute(
+                """
+                SELECT list_id FROM pick_lists
+                WHERE event_key = ? AND scout_id = ? AND name = ?
+                """,
+                (clean_event_key, clean_scout_id, clean_name),
+            ).fetchone()
+            now = utc_now()
+            if existing is None:
+                list_id = uuid4().hex
+                connection.execute(
+                    """
+                    INSERT INTO pick_lists(list_id, event_key, scout_id, name, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (list_id, clean_event_key, clean_scout_id, clean_name, now, now),
+                )
+            else:
+                list_id = str(existing[0])
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO pick_list_teams(list_id, team_number, added_at)
+                VALUES (?, ?, ?)
+                """,
+                (list_id, team_number, now),
+            )
+            if cursor.rowcount:
+                connection.execute(
+                    "UPDATE pick_lists SET updated_at = ? WHERE list_id = ?", (now, list_id)
+                )
+    except sqlite3.DatabaseError as error:
+        raise PickListError(f"Could not update the pick list: {error}") from error
+    finally:
+        connection.close()
+    return PickListAddResult(list_name=clean_name, team_added=bool(cursor.rowcount))
+
+
+def add_alliance_selection(
+    database_path: Path | str,
+    event_key: str,
+    alliance_number: int,
+    team_number: int,
+    selection_kind: str,
+) -> None:
+    """Record a captain or picked team for an event alliance."""
+    if alliance_number not in range(1, 9) or team_number <= 0:
+        raise PickListError("Choose a valid alliance and team.")
+    if selection_kind not in {"captain", "pick"}:
+        raise PickListError("Choose whether this team is a captain or a pick.")
+    connection = sqlite3.connect(Path(database_path))
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.executescript(MIGRATION_10_SQL)
+        with connection:
+            team_exists = connection.execute(
+                "SELECT 1 FROM teams WHERE team_number = ?", (team_number,)
+            ).fetchone()
+            if team_exists is None:
+                raise PickListError("That team is no longer in this database.")
+            connection.execute(
+                """
+                INSERT INTO alliance_selections(
+                    event_key, team_number, alliance_number, selection_kind, selected_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (event_key, team_number, alliance_number, selection_kind, utc_now()),
+            )
+    except sqlite3.IntegrityError as error:
+        raise PickListError("That team has already been selected by an alliance.") from error
+    except sqlite3.DatabaseError as error:
+        raise PickListError(f"Could not update alliance selections: {error}") from error
+    finally:
+        connection.close()
+
+
+def remove_alliance_selection(
+    database_path: Path | str, event_key: str, team_number: int
+) -> None:
+    """Return a team to the available pool for the current event."""
+    connection = sqlite3.connect(Path(database_path))
+    try:
+        with connection:
+            connection.execute(
+                "DELETE FROM alliance_selections WHERE event_key = ? AND team_number = ?",
+                (event_key, team_number),
+            )
+    except sqlite3.DatabaseError as error:
+        raise PickListError(f"Could not remove alliance selection: {error}") from error
+    finally:
+        connection.close()
+
+
+def remove_latest_alliance_selection(database_path: Path | str, event_key: str) -> bool:
+    """Undo the most recently recorded alliance selection for an event."""
+    connection = sqlite3.connect(Path(database_path))
+    try:
+        with connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM alliance_selections
+                WHERE rowid = (
+                    SELECT rowid FROM alliance_selections
+                    WHERE event_key = ?
+                    ORDER BY selected_at DESC, rowid DESC
+                    LIMIT 1
+                )
+                """,
+                (event_key,),
+            )
+            return bool(cursor.rowcount)
+    except sqlite3.DatabaseError as error:
+        raise PickListError(f"Could not undo alliance selection: {error}") from error
+    finally:
+        connection.close()
+
+
+def update_team_summary(
+    database_path: Path | str, event_key: str, team_number: int, summary: str
+) -> None:
+    """Save a user-edited role summary and rebuild its semantic entry on demand."""
+    clean_summary = " ".join(summary.split())
+    if not clean_summary:
+        raise TeamSummaryError("Role summaries cannot be empty.")
+    connection = sqlite3.connect(Path(database_path))
+    try:
+        with connection:
+            cursor = connection.execute(
+                """
+                UPDATE team_summaries
+                SET summary = ?, generated_at = ?
+                WHERE event_key = ? AND team_number = ?
+                  AND generated_at = (
+                      SELECT MAX(generated_at) FROM team_summaries
+                      WHERE event_key = ? AND team_number = ?
+                  )
+                """,
+                (clean_summary, utc_now(), event_key, team_number, event_key, team_number),
+            )
+            if not cursor.rowcount:
+                raise TeamSummaryError("Generate a role summary before editing it.")
+            connection.execute(
+                """
+                DELETE FROM embedding_chunks
+                WHERE event_key = ? AND team_number = ? AND chunk_type = 'team_summary'
+                """,
+                (event_key, team_number),
+            )
+    except sqlite3.DatabaseError as error:
+        raise TeamSummaryError(f"Could not save the role summary: {error}") from error
+    finally:
+        connection.close()
 
 
 @dataclass
@@ -508,6 +1123,28 @@ class AnalyticsDatabase:
             if "red_penalty_points" not in match_columns:
                 self.connection.executescript(MIGRATION_5_SQL)
             self.connection.execute("INSERT INTO schema_migrations(version) VALUES (5)")
+        if 6 not in applied_versions:
+            self.connection.executescript(MIGRATION_6_SQL)
+            self.connection.execute("INSERT INTO schema_migrations(version) VALUES (6)")
+        if 7 not in applied_versions:
+            self.connection.executescript(MIGRATION_7_SQL)
+            self.connection.execute("INSERT INTO schema_migrations(version) VALUES (7)")
+        if 8 not in applied_versions:
+            self.connection.executescript(MIGRATION_8_SQL)
+            self.connection.execute("INSERT INTO schema_migrations(version) VALUES (8)")
+        if 9 not in applied_versions:
+            self.connection.executescript(MIGRATION_9_SQL)
+            self.connection.execute("INSERT INTO schema_migrations(version) VALUES (9)")
+        if 10 not in applied_versions:
+            self.connection.executescript(MIGRATION_10_SQL)
+            self.connection.execute("INSERT INTO schema_migrations(version) VALUES (10)")
+        if 11 not in applied_versions:
+            observation_columns = {
+                row[1] for row in self.connection.execute("PRAGMA table_info(observations)")
+            }
+            if "robot_broken" not in observation_columns:
+                self.connection.executescript(MIGRATION_11_SQL)
+            self.connection.execute("INSERT INTO schema_migrations(version) VALUES (11)")
         self.connection.commit()
 
     def import_existing_data(
@@ -677,7 +1314,7 @@ class AnalyticsDatabase:
             report.add("invalid")
             return
 
-        # Gemini writes its cached result under ``analytics`` in the original
+        # AI enrichment writes its cached result under ``analytics`` in the original
         # scouting JSON.  That metadata must not turn an otherwise identical
         # observation into a second import when files are re-imported or merged.
         if self._imported_scouting_payload_exists(payload):
@@ -723,9 +1360,9 @@ class AnalyticsDatabase:
                     """
                     INSERT INTO observations(
                         observation_id, match_key, team_number, scout_id, predicted_winner,
-                        reported_total_points, source_schema_version, schedule_alignment,
+                        robot_broken, reported_total_points, source_schema_version, schedule_alignment,
                         source_file_hash, imported_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         observation_id,
@@ -733,6 +1370,7 @@ class AnalyticsDatabase:
                         team_number,
                         scout_id,
                         nullable_alliance(payload.get("predicted_winner")),
+                        1 if payload.get("robot_broken") is True else 0,
                         integer(payload.get("total_points")),
                         integer(payload.get("schema_version")) or 1,
                         alignment,

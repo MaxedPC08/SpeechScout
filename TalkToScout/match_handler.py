@@ -34,6 +34,7 @@ class MatchHandler:
         self._last_score_key: Optional[str] = None
         self._last_score_at: Optional[float] = None
         self._last_note_chunk_at: Optional[float] = None
+        self._robot_broken = False
 
     def start_match(self, predicted_winner: Optional[str] = None, path: Optional[str] = None) -> None:
         if predicted_winner not in {"red", "blue"}:
@@ -46,6 +47,7 @@ class MatchHandler:
             self._last_score_key = None
             self._last_score_at = None
             self._last_note_chunk_at = None
+            self._robot_broken = False
             self.predicted_winner = predicted_winner
             
             if path is not None:
@@ -66,6 +68,7 @@ class MatchHandler:
             match_data["scout_name"] = self.scout_name
             match_data["scout_number"] = self.scout_number
             match_data["predicted_winner"] = self.predicted_winner
+            match_data["robot_broken"] = self._robot_broken
             if self.path is None:
                 raise ValueError("Match path is not set.")
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -79,6 +82,11 @@ class MatchHandler:
         self.save_match()
         with self._lock:
             self._started_at = None
+
+    def set_robot_broken(self, broken: bool) -> None:
+        """Record the scout's end-of-match robot condition."""
+        with self._lock:
+            self._robot_broken = bool(broken)
 
     def process_chunk(self, transcript: str, is_final: bool = True) -> Optional[ScoreEvent]:
         """Record one STT chunk and return its score event, if it creates one."""
@@ -211,4 +219,5 @@ class MatchHandler:
             "last_transcript": self._last_transcript,
             "events": self._events,
             "notes": self._notes,
+            "robot_broken": self._robot_broken,
         }
