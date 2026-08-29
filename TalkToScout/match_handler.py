@@ -149,7 +149,6 @@ class MatchHandler:
                     ):
                         return None
 
-                    self._discard_pending_note()
                     event = ScoreEvent(
                         name="breakdown",
                         points=0,
@@ -185,7 +184,6 @@ class MatchHandler:
             ):
                 return None
 
-            self._discard_pending_note()
             event = ScoreEvent(
                 name=name,
                 points=int(points),
@@ -204,11 +202,6 @@ class MatchHandler:
         else:
             self._notes.append(MatchNote(said_at, transcript))
         self._last_note_chunk_at = said_at
-
-    def _discard_pending_note(self) -> None:
-        if self._last_note_chunk_at is not None and self._notes:
-            self._notes.pop()
-        self._last_note_chunk_at = None
 
     def snapshot(self) -> Dict:
         return {

@@ -27,7 +27,7 @@ from urllib.request import Request, urlopen
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 PROJECT_DIRECTORY = Path(__file__).resolve().parents[1]
 ANALYTICS_DIRECTORY = Path(__file__).resolve().parent
 DEFAULT_DATABASE_PATH = ANALYTICS_DIRECTORY / "speechscout.sqlite3"
@@ -1138,12 +1138,15 @@ class AnalyticsDatabase:
         if 10 not in applied_versions:
             self.connection.executescript(MIGRATION_10_SQL)
             self.connection.execute("INSERT INTO schema_migrations(version) VALUES (10)")
+        # Check the physical table even when the migration ledger says version 11
+        # was applied.  A previous interrupted/manual upgrade can leave that ledger
+        # out of sync, and the analytics queries must remain safe to open.
+        observation_columns = {
+            row[1] for row in self.connection.execute("PRAGMA table_info(observations)")
+        }
+        if "robot_broken" not in observation_columns:
+            self.connection.executescript(MIGRATION_11_SQL)
         if 11 not in applied_versions:
-            observation_columns = {
-                row[1] for row in self.connection.execute("PRAGMA table_info(observations)")
-            }
-            if "robot_broken" not in observation_columns:
-                self.connection.executescript(MIGRATION_11_SQL)
             self.connection.execute("INSERT INTO schema_migrations(version) VALUES (11)")
         self.connection.commit()
 
